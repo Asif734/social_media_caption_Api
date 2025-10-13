@@ -1,26 +1,31 @@
+#app/api/v1/endpoints/caption.py
+
+import os
+import uuid
+import re
+import asyncio
+from typing import List, Optional, Union
 
 from fastapi import APIRouter, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
-from typing import List, Optional, Union
-import json
-import re
-import httpx
-import os
 
 from app.models.captions import CaptionInput, EditRequest
 from app.services.captions_service import (
+    generate_caption,
     build_prompt_for_platform,
-    call_openai_api,
     build_edit_prompt,
     describe_image
 )
 
 router = APIRouter()
+TEMP_DIR = os.path.join(os.getcwd(), "temp_images")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 
 @router.post(
     "/caption",
-    summary="Merged endpoint for generating or editing captions",
-    response_description="Generated or edited caption based on edit_type parameter"
+    summary="Generate or edit captions with optional images",
+    response_description="Generated or edited caption and hashtags"
 )
 async def merged_caption_endpoint(
     platforms: List[str] = Form(...),
@@ -31,18 +36,13 @@ async def merged_caption_endpoint(
     image: Union[UploadFile, str] = File(None)
 ):
     """
-    Merged endpoint that handles both caption generation and editing.
-    - If edit_type is empty → generate a new caption
-    - If edit_type has a value → edit the existing caption
+    Handles both caption generation and editing.
+    - If edit_type is empty → generate new captions
+    - If edit_type is provided → edit the existing caption while keeping hashtags
     """
-    
-    # # Handle optional image
-    # if isinstance(image, str) or image is None or image == "":
-    #     image_bytes = None
-    # else:
-    #     image_bytes = await image.read()
 
-    # Define the temp folder
+    # ---------------------------
+
     TEMP_DIR = os.path.join(os.getcwd(), "temp_images")
     os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -55,7 +55,7 @@ async def merged_caption_endpoint(
             f.write(await image.read())
         
         # Generate description using the overwritten file
-        description = describe_image(image_path)
+        description =await describe_image(image_path)
 
         # Merge with post_topic
         if post_type and post_topic:
@@ -67,67 +67,79 @@ async def merged_caption_endpoint(
         else:
             post_topic = f"Image: {description}"
 
-    # Logic: If edit_type is empty → generate a new caption
+    # ---------------------------
+    # 2️⃣ Generate new captions
+    # ---------------------------
     if not edit_type or edit_type.strip() == "":
-        # Generate new caption logic
         input_data = CaptionInput(
             platforms=platforms,
             post_type=post_type,
-            post_topic=post_topic,
+            post_topic=post_topic
         )
 
+        tasks = [
+            generate_caption(build_prompt_for_platform(input_data, platform))
+            for platform in platforms
+        ]
+        outputs = await asyncio.gather(*tasks, return_exceptions=True)
+
         results = {}
-        for platform in platforms:
-            try:
-                prompt = build_prompt_for_platform(input_data, platform)
-                llm_output = await call_openai_api(prompt)
-                results[platform.lower()] = llm_output
-            except Exception as e:
-                results[platform.lower()] = {"error": str(e)}
+        for platform, output in zip(platforms, outputs):
+            if isinstance(output, Exception):
+                results[platform.lower()] = {"caption": "", "hashtags": [], "error": str(output)}
+            else:
+                # Clean caption text
+                raw_caption = output.get("caption", "").strip()
+                cleaned_lines = [
+                    re.sub(r'\s+', ' ', re.sub(r'#\w+', '', line)).strip()
+                    for line in raw_caption.splitlines()
+                ]
+                cleaned_caption = "\n".join([l for l in cleaned_lines if l])
+
+                hashtags = output.get("hashtags", [])
+                results[platform.lower()] = {"caption": cleaned_caption, "hashtags": hashtags}
 
         return JSONResponse(content=results)
-    
-    # Logic: If edit_type has a value → edit the existing caption
+
+    # ---------------------------
+    # 3️⃣ Edit existing caption
+    # ---------------------------
     else:
-        # Edit existing caption logic
         if not caption:
-            raise HTTPException(status_code=400, detail="Caption is required when edit_type is provided")
-        
+            raise HTTPException(
+                status_code=400,
+                detail="Caption is required when edit_type is provided"
+            )
+
         edit_data = EditRequest(
             platform=platforms,
             original_caption=caption,
             edit_type=edit_type
         )
-        
+
         try:
             prompt = build_edit_prompt(edit_data)
-            llm_output = await call_openai_api(prompt)
+            llm_output = await generate_caption(prompt)
 
-            if not isinstance(llm_output, dict) or "caption" not in llm_output or "hashtags" not in llm_output:
-                raise ValueError("LLM returned an unexpected JSON structure. Expected 'caption' and 'hashtags' keys.")
+            if not isinstance(llm_output, dict) or "caption" not in llm_output:
+                raise ValueError("LLM returned unexpected JSON structure")
 
-            caption_raw = llm_output.get("caption", "").strip()
+            # Clean caption
+            raw_caption = llm_output.get("caption", "").strip()
+            cleaned_lines = [
+                re.sub(r'\s+', ' ', re.sub(r'#\w+', '', line)).strip()
+                for line in raw_caption.splitlines()
+            ]
+            edited_caption = "\n".join([l for l in cleaned_lines if l])
 
-            # Process the caption to ensure no stray hashtags are left in the text
-            cleaned_caption_lines = []
+            # Keep original hashtags if available
+            hashtags = getattr(edit_data, "hashtags", []) or llm_output.get("hashtags", [])
 
-            for line in caption_raw.splitlines():
-                # Remove any hashtags embedded directly in the caption text
-                cleaned_line = re.sub(r'#\w+', '', line).strip()
-                if cleaned_line:
-                    cleaned_caption_lines.append(cleaned_line)
-
-            edited_caption = "\n".join(cleaned_caption_lines).strip()
-
-            return JSONResponse(content={
-                "caption": edited_caption
-            })
+            return JSONResponse(content={"caption": edited_caption, "hashtags": hashtags})
 
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=f"LLM processing error: {ve}")
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=e.response.status_code, detail=f"OpenAI API error: {e.response.text}")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=500, detail=f"Network error during API call: {e}")
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"An unexpected internal server error occurred: {e}")
+            raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+

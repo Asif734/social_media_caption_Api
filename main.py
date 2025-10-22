@@ -5,7 +5,7 @@ from app.api.v1.api import api_router
 
 app = FastAPI(title="Caption Generator")
 
-@api_router.get("/")
+@api_router.get("/api/ai")
 def api_root():
     return {"message": "API v1 working"}
 # Register API routes
